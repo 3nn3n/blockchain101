@@ -1,7 +1,11 @@
 use sha2::{Digest, Sha256};
 use serde::{Serialize, Deserialize};
+use tokio::sync::mpsc;
+use std::{sync::Arc};
+use tokio::sync::Mutex;
 
-#[derive(Serialize, Deserialize, Debug)]
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct Block {
     index: u64,
     timestamp: u128,
@@ -70,13 +74,15 @@ impl Block {
 
 struct Blockchain {
     chain: Vec<Block>,
+    difficulty: usize
 }
 
 impl Blockchain {
     
-    fn new() -> Self {
+    fn new(difficulty: usize) -> Self {
         Blockchain {
             chain: vec![Block::genesis_block()],
+            difficulty,
         }
     }
 
@@ -114,31 +120,220 @@ impl Blockchain {
         println!("Block added successfully");
         true
     }
+
+    fn is_valid_chain(chain: &[Block], difficulty: usize) -> bool {
+        if chain.is_empty() { return false; }
+        for i in 1..chain.len() {
+            let prev = &chain[i - 1];
+            let cur = &chain[i];
+            if cur.previous_hash != prev.hash { return false; }
+            let recomputed = Block::compute_hash(cur.index, cur.timestamp, &cur.previous_hash, &cur.data, cur.nonce);
+            if recomputed != cur.hash { return false; }
+            if !cur.hash.starts_with(&"0".repeat(difficulty)) { return false; }
+        }
+        true
+    }
+
+    fn replace_chain(&mut self, new_chain: Vec<Block>) -> bool {
+        if new_chain.len() > self.chain.len() && Blockchain::is_valid_chain(&new_chain, self.difficulty) {
+            self.chain = new_chain;
+            true
+        } else {
+            false
+        }
+    }
 }
 
-fn main() {
+struct Node {
+    id: usize,
+    blockchain: Arc<Mutex<crate::Blockchain>>,
+    senders: Vec<mpsc::Sender<Message>>,
+    receiver: mpsc::Receiver<Message>,
+}
+
+impl Node {
+    fn new(id: usize, difficulty: usize) -> (Self, mpsc::Sender<Message>) {
+
+        let (tx, rx) = mpsc::channel(100);
+        let blockchain = crate::Blockchain::new(difficulty);
+
+        (
+            Node {
+                id,
+                blockchain: Arc::new(Mutex::new(blockchain)),
+                senders: Vec::new(),
+                receiver: rx,
+            },
+            tx,
+        )
+    }
+
+    fn connect (&mut self, sender: mpsc::Sender<Message>) {
+        self.senders.push(sender);
+    }
     
-    let mut chain = Blockchain::new();
+    async fn broadcast (&self, msg: Message) {
+        for p in &self.senders {
+            let _ = p.send(msg.clone()).await;
 
-    let difficulty = 3;
+        }
+    }
 
-    let b1 = Block::mine_block(
-        1, 
-        1, 
-        String::from("I mined a block"), 
-        chain.last_block().hash.clone(), 
-        difficulty);
+    async fn run (mut self) {
+        while let Some(msg) = self.receiver.recv().await {
+            match msg {
+                Message::Mine(data) => {
+                    let blockchain_clone = self.blockchain.clone();
+                    let senders_clone = self.senders.clone();
+                    let my_id = self.id;
 
-    chain.add_block(b1);
+                    //mining
+                    tokio::spawn(async move {
 
-    let b2 = Block::mine_block(2, 
-        2,
-        String::from("second block mined"), 
-        chain.last_block().hash.clone(),
-         difficulty);
+                        let (index, previous_hash, difficulty) = {
+                            let bchain = blockchain_clone.lock().await;
+
+                            (bchain.last_block().index + 1, bchain.last_block().hash.clone(), bchain.difficulty)
+                        };
+
+                        let timestamp = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis();
+                    
+                        let block_mined = tokio::task::spawn_blocking(move || {
+                            crate::Block::mine_block(index, timestamp, data, previous_hash, difficulty)
+                        }).await.expect("mining task panicked");
+
+                        let mut bchain = blockchain_clone.lock().await;
+
+                        if bchain.add_block(block_mined.clone()) {
+                            println!("node {} mined block {}", my_id, block_mined.index);
+
+                            drop(bchain);
+
+                            for p in senders_clone {
+                                let _ = p.send(Message::NewBlock(block_mined.clone())).await;
+                            }
+                        } else {
+                            println!("node is {}. but couldn't add it locally", my_id)
+                        }
+
+                    });
+
+                }
+                
+                Message::NewBlock(block) => {
+
+                    let mut bchain = self.blockchain.lock().await;
+
+                    if bchain.add_block(block.clone()) {
+                        println!("node {}, {} block is accepted and broadcasting", self.id, block.index);
+                        drop(bchain);
+                        self.broadcast(Message::NewBlock(block)).await;
+                        
+                    } else {
+                        println!("node is {}, block is rejected {} -- requesting chain", self.id, block.index);
+                        drop(bchain);
+
+                        //requesting the chain with our id
+                        self.broadcast(Message::RequestChain(self.id)).await;
+                    }
+                }
+
+                Message::RequestChain(from_id) => {
+                    let bchain = self.blockchain.lock().await;
+                    let blockchain_copy = bchain.chain.clone();
+
+                    drop(bchain);
+
+                    println!("node {}, chain is requesting from id: {}", self.id, from_id);
+                    self.broadcast(Message::Chain(blockchain_copy)).await;
+
+                }
+
+                Message::Chain(in_chain) => {
+                    let mut bchain = self.blockchain.lock().await;
+
+                    if bchain.replace_chain(in_chain.clone()) {
+                        println!("node: {}, new chain replaced the old chain (len {})", self.id, in_chain.len());
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+#[tokio::main]
+async fn main() {
+
+    let node_total = 4usize;
+    let difficulty = 3usize;
+    let run_time = 10u64;
+
+    //nodes and senders creations
+
+    let mut nodes = Vec::new();
+    let mut transactions = Vec::new();
+
+    for i in 0..node_total {
+        let (node, tx) = Node::new(i, difficulty);
+
+        nodes.push(node);
+        transactions.push(tx);
+    }
+
+    //connect receivers
+    for i in 0..node_total {
+        for j in 0..node_total {
+            if i == j {
+                continue;
+            }
+            nodes[i].connect(transactions[j].clone()    );
+        }
+    }
+
+    for node in nodes {
+        tokio::spawn(node.run());
+    }
+
+    use rand::Rng;
+
+    let mut rng = rand::thread_rng();
+    let start = std::time::SystemTime::now();
+
+
+    //mine random node
+    while std::time::SystemTime::now()
+        .duration_since(start).unwrap().as_secs() < run_time {
+            let somene = rng.gen_range(0..node_total);
+            let data = format!("transaction: {}", rng.gen_range(0u64..u64::MAX));
+
+            let _ = transactions[somene].send(Message::Mine(data)).await;
+
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+        }
+
+        //broadcast node
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        for tx in &transactions {
+            let _ = tx.send(Message::RequestChain(999)).await;
+        }
+
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        println!("Finished the simulation")
+
     
-    chain.add_block(b2);
+}
 
-    println!("Blockchain: {:#?}", chain.chain);
-
+#[derive(Clone)]
+enum Message {
+    Mine(String),
+    NewBlock(crate::Block),
+    RequestChain(usize),
+    Chain(Vec<crate::Block>),
 }
