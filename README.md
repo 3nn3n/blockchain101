@@ -130,12 +130,4 @@ This design prevents:
 6. Final chains converge
 
 
-## What This Demonstrates
-
-✔ Distributed systems fundamentals
-✔ Blockchain consensus mechanics
-✔ Rust async + sync interoperability
-✔ Fault tolerance via validation
-✔ Protocol-grade system thinking
-
 
